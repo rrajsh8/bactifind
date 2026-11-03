@@ -1,0 +1,31 @@
+# Render Blueprint for the BactiFIND cloud server.
+# Put the contents of this "server" folder in its own GitHub repository, then in Render:
+# New → Blueprint → choose the repository. Render creates the web service and the database.
+services:
+  - type: web
+    name: bactifind-api
+    runtime: node
+    plan: free            # free instances sleep after ~15 min idle (first request then takes up to a minute)
+    region: singapore     # closest Render region to India
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: bactifind-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_EMAILS
+        sync: false       # you type your admin email(s) during setup
+      - key: ALLOWED_ORIGINS
+        sync: false       # optional, e.g. https://yoursite.netlify.app,https://appassets.androidplatform.net
+      - key: NODE_VERSION
+        value: "20"
+
+databases:
+  - name: bactifind-db
+    databaseName: bactifind
+    plan: free            # check Render's current limits: free databases are time-limited — use a paid plan for real data
+    region: singapore

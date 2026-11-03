@@ -1,0 +1,17 @@
+{
+  "name": "bactifind-api",
+  "version": "1.0.0",
+  "description": "BactiFIND cloud server: accounts and Premium, cloud backup, shared lab data, usage statistics",
+  "main": "server.js",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "pg": "8.11.3"
+  }
+}
