@@ -1,0 +1,47 @@
+# Daily encrypted backup of the Neon database.
+# The repo is public, so the dump is AES-256 encrypted before it is stored.
+# Only someone with BACKUP_PASSPHRASE can open it.
+name: daily-db-backup
+
+on:
+  schedule:
+    - cron: '30 20 * * *'   # 02:00 India time, every day
+  workflow_dispatch: {}      # "Run workflow" button for a backup on demand
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump, compress and encrypt
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DATABASE_URL}" ] || [ -z "${BACKUP_PASSPHRASE}" ]; then
+            echo "Missing DATABASE_URL or BACKUP_PASSPHRASE secret"; exit 1
+          fi
+          # pg_dump should use Neon's direct host, not the pooler.
+          export PGURL="${DATABASE_URL/-pooler/}"
+          STAMP=$(date -u +%Y-%m-%d)
+          FILE="bactifind-${STAMP}.sql.gz.enc"
+          docker run --rm -e PGURL postgres:18 \
+            sh -c 'pg_dump --no-owner --no-privileges "$PGURL"' \
+            | gzip -9 \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:BACKUP_PASSPHRASE -out "$FILE"
+          # Check the file opens again and looks like a real dump.
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:BACKUP_PASSPHRASE -in "$FILE" \
+            | gunzip | grep -q 'CREATE TABLE'
+          echo "FILE=$FILE" >> "$GITHUB_ENV"
+          ls -l "$FILE"
+
+      - name: Keep for 30 days
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FILE }}
+          path: ${{ env.FILE }}
+          retention-days: 30
+          compression-level: 0
