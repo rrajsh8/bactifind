@@ -19,10 +19,15 @@ const no = async (p, b, t, status) => { const r = await call(p, b, t); assert.st
 const test = async (name, fn) => { await fn(); passed++; console.log('✔', name); };
 
 (async () => {
-  await store.init();
-  console.log(`store: ${store.kind}`);
-  await new Promise(r => server.listen(0, r));
-  base = `http://127.0.0.1:${server.address().port}`;
+  // TEST_BASE_URL = test a server that is already running (e.g. a Neon Function on a test branch, deployed with
+  // ADMIN_EMAILS=admin@lab.test, ALLOWED_ORIGINS=https://site.test,https://*--site.test and MAX_DEVICES=2)
+  if (process.env.TEST_BASE_URL) { base = process.env.TEST_BASE_URL.replace(/\/+$/, ''); console.log(`server: ${base}`); }
+  else {
+    await store.init();
+    console.log(`store: ${store.kind}`);
+    await new Promise(r => server.listen(0, r));
+    base = `http://127.0.0.1:${server.address().port}`;
+  }
   const get = (p, t) => ok('/api/doc/get', { path: p }, t).then(b => b.data);
   const set = (p, data, t, merge) => ok('/api/doc/set', { path: p, data, merge }, t);
 
@@ -31,7 +36,11 @@ const test = async (name, fn) => { await fn(); passed++; console.log('✔', name
     await no('/api/auth/signup', { email: 'bad', password: 'longenough' }, null, 400);
     await no('/api/auth/signup', { email: 'a@lab.test', password: 'short' }, null, 400);
     admin = await ok('/api/auth/signup', { email: 'Admin@Lab.test', password: 'adminpass1' });
-    alice = await ok('/api/auth/signup', { email: 'alice@lab.test', password: 'alicepass1' });
+    const info = { firstName: 'Alice', lastName: 'Rao', designation: 'Assistant Professor', institute: 'GMC Nagpur', phone: '+91 98765 43210' };
+    await no('/api/auth/signup', { email: 'x1@lab.test', password: 'longenough', info: Object.assign({}, info, { institute: ' ' }) }, null, 400);
+    await no('/api/auth/signup', { email: 'x2@lab.test', password: 'longenough', info: Object.assign({}, info, { phone: 'call me' }) }, null, 400);
+    await no('/api/auth/signup', { email: 'x3@lab.test', password: 'longenough', info: Object.assign({}, info, { premium: true }) }, null, 400);
+    alice = await ok('/api/auth/signup', { email: 'alice@lab.test', password: 'alicepass1', info });
     bob = await ok('/api/auth/signup', { email: 'bob@lab.test', password: 'bobpass123' });
     eve = await ok('/api/auth/signup', { email: 'eve@lab.test', password: 'evepass123' });
     await no('/api/auth/signup', { email: 'alice@lab.test', password: 'another123' }, null, 409);
@@ -58,6 +67,8 @@ const test = async (name, fn) => { await fn(); passed++; console.log('✔', name
     const list = await ok('/api/admin/pending', null, admin.token);
     const mine = rows => rows.filter(r => r.email.endsWith('@lab.test')); // a test database copy may hold other accounts
     assert.deepStrictEqual(mine(list.rows).map(r => r.email).sort(), ['alice@lab.test', 'bob@lab.test', 'eve@lab.test']);
+    assert.deepStrictEqual(list.rows.find(r => r.email === 'alice@lab.test').info, { firstName: 'Alice', lastName: 'Rao', designation: 'Assistant Professor', institute: 'GMC Nagpur', phone: '+91 98765 43210' });
+    assert.strictEqual(list.rows.find(r => r.email === 'bob@lab.test').info, null); // older app versions send no details
     await no('/api/admin/approve', { uid: alice.user.uid, months: -1 }, admin.token, 400);
     await ok('/api/admin/approve', { uid: alice.user.uid, months: 12 }, admin.token);
     await ok('/api/admin/approve', { uid: bob.user.uid, months: null }, admin.token);
