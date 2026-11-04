@@ -4,10 +4,15 @@
 // Environment:
 //   DATABASE_URL     Render PostgreSQL connection string (without it the server keeps data in memory — for testing only)
 //   JWT_SECRET       long random string used to sign sign-in tokens (Render can generate it)
-//   ADMIN_EMAILS     comma-separated admin account emails (they can give Premium and see usage statistics)
+//   ADMIN_EMAILS     comma-separated main admin emails: they approve accounts, give Premium, and add or remove other admins
+//                    (added admins are kept in the database document config/admins and can do everything except manage admins)
+//   SIGNUP_ALERT_URL optional: address that gets a short POST (no personal details) when a new account waits for approval,
+//                    for example an ntfy.sh topic, so the admin's phone shows a notification
 //   ALLOWED_ORIGINS  optional comma-separated list of web origins allowed to call the API (default: any)
 //   PGSSL            optional: require | disable (default: SSL only for external *.render.com database URLs)
 //   MAX_DEVICES      optional: signed-in devices per account (default 2; the oldest is signed out; admins unlimited)
+//   STORAGE_LIMIT_MB optional: cloud space per account, for its backup plus the lab records it added (default 2 MB,
+//                    so about 425 full accounts fit the 1 GB free Neon plan with room for the database itself). Admins have no limit.
 //   PORT             set by Render
 
 const http = require('http');
@@ -21,6 +26,10 @@ const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()
 const ORIGIN_RES = ORIGINS.map(o => new RegExp('^' + o.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[a-z0-9-]+') + '$', 'i'));
 const MAX_DEVICES = Math.max(1, +process.env.MAX_DEVICES || 2); // signed-in devices per account
 const TOKEN_DAYS = 60;
+// Cloud space per account (characters of stored data): 1 GB plan − ~150 MB for the database, indexes and history ≈ 850 MB ÷ 2 MB ≈ 425 full accounts
+const STORAGE_LIMIT = Math.round((+process.env.STORAGE_LIMIT_MB > 0 ? +process.env.STORAGE_LIMIT_MB : 2) * 1048576);
+// Size of one stored document as counted against the limit: backup pieces by their text, other documents as JSON
+const docSize = d => !d ? 0 : typeof d.v === 'string' ? d.v.length : JSON.stringify(d).length;
 const MAX_BODY = 8 * 1024 * 1024;
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
   if (process.env.DATABASE_URL) { console.error('JWT_SECRET must be set to at least 32 characters.'); process.exit(1); }
@@ -29,7 +38,7 @@ const SECRET = JWT_SECRET || crypto.randomBytes(32).toString('hex'); // memory m
 
 // ---------------- Storage ----------------
 function memoryStore() {
-  const docs = new Map(), accounts = new Map(), usage = new Map(), sessions = new Map(), auditLog = [], hits = new Map();
+  const docs = new Map(), accounts = new Map(), sessions = new Map(), auditLog = [], hits = new Map();
   const copy = v => v == null ? null : JSON.parse(JSON.stringify(v));
   setInterval(() => { const now = Date.now(); hits.forEach((h, k) => { if (now - h.t > 3600e3) hits.delete(k); }); }, 600e3).unref();
   return {
@@ -41,6 +50,7 @@ function memoryStore() {
     async sessionsOf(uid) { return [...sessions.values()].filter(s => s.uid === uid).sort((a, b) => b.created_at - a.created_at).map(copy); },
     async deleteSession(sid) { sessions.delete(sid); },
     async deleteSessionsOf(uid, keepSid) { [...sessions.values()].forEach(s => { if (s.uid === uid && s.sid !== keepSid) sessions.delete(s.sid); }); },
+    async deleteSessionsBefore(t) { [...sessions.values()].forEach(s => { if (s.created_at < t) sessions.delete(s.sid); }); },
     async audit(entry) { auditLog.push(copy(entry)); },
     async auditList(limit) { return auditLog.slice().sort((a, b) => b.at - a.at).slice(0, limit).map(copy); },
     async get(path) { return copy(docs.get(path)); },
@@ -60,8 +70,25 @@ function memoryStore() {
     async setPassword(uid, pass) { const a = accounts.get(uid); if (a) a.pass = pass; },
     async setStatus(uid, status) { const a = accounts.get(uid); if (a) a.status = status; },
     async accountsWithStatus(list) { return [...accounts.values()].filter(a => list.includes(a.status)).sort((a, b) => b.created_at - a.created_at).slice(0, 200).map(a => ({ uid: a.uid, email: a.email, created_at: a.created_at, status: a.status, info: copy(a.info || null) })); },
-    async count(day, name, module) { const k = `${day}|${name}|${module}`; usage.set(k, (usage.get(k) || 0) + 1); },
-    async stats(sinceDay) { const out = {}; usage.forEach((n, k) => { const [d, name, m] = k.split('|'); if (d >= sinceDay) { const key = `${name}|${m}`; out[key] = (out[key] || 0) + n; } }); return Object.entries(out).map(([k, n]) => { const [name, module] = k.split('|'); return { name, module, n }; }).sort((a, b) => b.n - a.n); }
+    async allAccounts(limit) {
+      return [...accounts.values()].sort((a, b) => b.created_at - a.created_at).slice(0, limit).map(a => ({
+        uid: a.uid, email: a.email, created_at: a.created_at, status: a.status, info: copy(a.info || null), ent: copy(docs.get(`entitlements/${a.uid}`) || null),
+        last_seen: Math.max(0, ...[...sessions.values()].filter(s => s.uid === a.uid).map(s => s.created_at)) || null }));
+    },
+    async updateAccount(uid, ch) { const a = accounts.get(uid); if (!a) return false; if (ch.email && [...accounts.values()].some(x => x.email === ch.email && x.uid !== uid)) return false; Object.assign(a, copy(ch)); return true; },
+    async deleteAccount(uid) { accounts.delete(uid); [...sessions.values()].forEach(s => { if (s.uid === uid) sessions.delete(s.sid); }); },
+    async docsUnder(prefix) { return [...docs.entries()].filter(([p]) => p.startsWith(prefix)).map(([path, data]) => ({ path, data: copy(data) })); },
+    async memberDocs(uid) { return [...docs.entries()].filter(([p]) => /^labs\/[^/]+\/members\/[^/]+$/.test(p) && p.endsWith('/' + uid)).map(([path, data]) => ({ path, data: copy(data) })); },
+    async countChildren(parent) { let n = 0; docs.forEach((_, p) => { if (p.slice(0, p.lastIndexOf('/')) === parent) n++; }); return n; },
+    async usage(uid) {
+      let backup = 0, lab = 0;
+      docs.forEach((d, p) => {
+        const par = p.slice(0, p.lastIndexOf('/'));
+        if (par === `users/${uid}/backup`) backup += docSize(d);
+        else if (/^labs\/[^/]+\/(isolates|qclog)$/.test(par) && d.by === uid) lab += docSize(d);
+      });
+      return { backup, lab };
+    },
   };
 }
 
@@ -95,13 +122,30 @@ function pgStore(url) {
     async setPassword(uid, pass) { await q('UPDATE accounts SET pass = $2 WHERE uid = $1', [uid, pass]); },
     async setStatus(uid, status) { await q('UPDATE accounts SET status = $2 WHERE uid = $1', [uid, status]); },
     async accountsWithStatus(list) { const r = await q('SELECT uid, email, created_at, status, info FROM accounts WHERE status = ANY($1) ORDER BY created_at DESC LIMIT 200', [list]); return r.rows.map(x => Object.assign(x, { created_at: +x.created_at })); },
-    async count(day, name, module) { await q('INSERT INTO usage (day, name, module, n) VALUES ($1, $2, $3, 1) ON CONFLICT (day, name, module) DO UPDATE SET n = usage.n + 1', [day, name, module]); },
-    async stats(sinceDay) { const r = await q('SELECT name, module, SUM(n)::int AS n FROM usage WHERE day >= $1 GROUP BY name, module ORDER BY n DESC LIMIT 200', [sinceDay]); return r.rows; },
+    async allAccounts(limit) {
+      const r = await q(`SELECT a.uid, a.email, a.created_at, a.status, a.info, d.data AS ent, (SELECT MAX(s.created_at) FROM sessions s WHERE s.uid = a.uid) AS last_seen
+        FROM accounts a LEFT JOIN docs d ON d.path = 'entitlements/' || a.uid ORDER BY a.created_at DESC LIMIT $1`, [limit]);
+      return r.rows.map(x => Object.assign(x, { created_at: +x.created_at, last_seen: x.last_seen == null ? null : +x.last_seen }));
+    },
+    async updateAccount(uid, ch) {
+      try { const r = await q('UPDATE accounts SET email = COALESCE($2, email), info = COALESCE($3, info) WHERE uid = $1', [uid, ch.email || null, ch.info ? JSON.stringify(ch.info) : null]); return r.rowCount === 1; }
+      catch (e) { if (e.code === '23505') return false; throw e; } // 23505: the new email belongs to another account
+    },
+    async deleteAccount(uid) { await q('DELETE FROM sessions WHERE uid = $1', [uid]); await q('DELETE FROM accounts WHERE uid = $1', [uid]); },
+    async docsUnder(prefix) { const r = await q('SELECT path, data FROM docs WHERE left(path, length($1)) = $1', [prefix]); return r.rows; },
+    async memberDocs(uid) { const r = await q("SELECT path, data FROM docs WHERE parent LIKE 'labs/%/members' AND path = parent || '/' || $1", [uid]); return r.rows; },
+    async countChildren(parent) { const r = await q('SELECT COUNT(*)::int AS n FROM docs WHERE parent = $1', [parent]); return r.rows[0].n; },
+    async usage(uid) {
+      const b = await q("SELECT COALESCE(SUM(CASE WHEN jsonb_typeof(data -> 'v') = 'string' THEN length(data ->> 'v') ELSE length(data::text) END), 0)::bigint AS n FROM docs WHERE parent = $1", [`users/${uid}/backup`]);
+      const l = await q("SELECT COALESCE(SUM(length(data::text)), 0)::bigint AS n FROM docs WHERE (parent LIKE 'labs/%/isolates' OR parent LIKE 'labs/%/qclog') AND data ->> 'by' = $1", [uid]);
+      return { backup: +b.rows[0].n, lab: +l.rows[0].n };
+    },
     async createSession(s) { await q('INSERT INTO sessions (sid, uid, created_at, label) VALUES ($1, $2, $3, $4)', [s.sid, s.uid, s.created_at, s.label]); },
     async sessionValid(sid, uid) { const r = await q('SELECT 1 FROM sessions WHERE sid = $1 AND uid = $2', [sid, uid]); return r.rowCount === 1; },
     async sessionsOf(uid) { const r = await q('SELECT sid, uid, created_at, label FROM sessions WHERE uid = $1 ORDER BY created_at DESC', [uid]); return r.rows.map(x => Object.assign(x, { created_at: +x.created_at })); },
     async deleteSession(sid) { await q('DELETE FROM sessions WHERE sid = $1', [sid]); },
     async deleteSessionsOf(uid, keepSid) { await q('DELETE FROM sessions WHERE uid = $1 AND sid <> $2', [uid, keepSid || '']); },
+    async deleteSessionsBefore(t) { await q('DELETE FROM sessions WHERE created_at < $1', [t]); },
     async audit(entry) { await q('INSERT INTO audit (at, data) VALUES ($1, $2)', [entry.at, JSON.stringify(entry)]); },
     async hit(key, windowMs) {
       const now = Date.now();
@@ -117,7 +161,6 @@ function pgStore(url) {
     await pool.query(`CREATE TABLE IF NOT EXISTS accounts (uid text PRIMARY KEY, email text UNIQUE NOT NULL, pass text NOT NULL, created_at bigint NOT NULL);
       CREATE TABLE IF NOT EXISTS docs (path text PRIMARY KEY, parent text NOT NULL, data jsonb NOT NULL, updated_at bigint NOT NULL);
       CREATE INDEX IF NOT EXISTS docs_parent ON docs (parent);
-      CREATE TABLE IF NOT EXISTS usage (day date NOT NULL, name text NOT NULL, module text NOT NULL, n integer NOT NULL DEFAULT 0, PRIMARY KEY (day, name, module));
       CREATE TABLE IF NOT EXISTS sessions (sid text PRIMARY KEY, uid text NOT NULL, created_at bigint NOT NULL, label text);
       CREATE INDEX IF NOT EXISTS sessions_uid ON sessions (uid);
       CREATE TABLE IF NOT EXISTS audit (id bigserial PRIMARY KEY, at bigint NOT NULL, data jsonb NOT NULL);
@@ -170,7 +213,9 @@ async function startSession(acc, req) {
   const sid = newId(24), ua = String(req.headers['user-agent'] || '');
   const label = /Android/i.test(ua) ? (/; wv\)/.test(ua) ? 'Android app' : 'Android browser') : /iPhone|iPad/i.test(ua) ? 'iPhone / iPad' : /Windows/i.test(ua) ? 'Windows browser' : /Mac OS/i.test(ua) ? 'Mac browser' : 'Browser';
   await store.createSession({ sid, uid: acc.uid, created_at: Date.now(), label });
-  if (!ADMINS.has(acc.email)) {
+  // Now and then remove sessions whose sign-in has expired (phones reset or lost never sign out)
+  if (Math.random() < 0.05) await store.deleteSessionsBefore(Date.now() - TOKEN_DAYS * 864e5);
+  if (!adminSet().has(acc.email)) {
     const all = await store.sessionsOf(acc.uid);
     for (const s of all.slice(MAX_DEVICES)) await store.deleteSession(s.sid);
   }
@@ -179,9 +224,34 @@ async function startSession(acc, req) {
 const newId = n => { const a = 'abcdefghjkmnpqrstuvwxyz23456789'; let s = ''; crypto.randomBytes(n).forEach(b => { s += a[b % a.length]; }); return s; };
 
 // ---------------- Access rules (mirror the app's expectations) ----------------
-const isAdmin = u => !!(u && ADMINS.has(u.email));
+// Admins: the main ones from ADMIN_EMAILS, plus the ones a main admin added (document config/admins, which the
+// document routes cannot read or write). Each server copy re-reads the list at most every 30 s.
+let addedAdmins = new Set(), addedAt = 0;
+const ADDED_PATH = 'config/admins';
+async function refreshAdmins(force) {
+  if (!force && Date.now() - addedAt < 30e3) return;
+  const d = await store.get(ADDED_PATH);
+  addedAdmins = new Set(((d && d.emails) || []).map(e => String(e).toLowerCase()));
+  addedAt = Date.now();
+}
+async function saveAdded(list) {
+  const emails = [...new Set(list.map(e => String(e).toLowerCase()))].filter(e => !ADMINS.has(e)).slice(0, 50);
+  await store.put(ADDED_PATH, { emails });
+  addedAdmins = new Set(emails); addedAt = Date.now();
+}
+const adminSet = () => addedAdmins.size ? new Set([...ADMINS, ...addedAdmins]) : ADMINS;
+const isAdmin = u => !!(u && adminSet().has(u.email));
+const isMainAdmin = u => !!(u && ADMINS.has(u.email));
 // New accounts wait for an admin: 'pending' until approved, or 'rejected'. Admin accounts are always approved.
-const statusOf = acc => ADMINS.has(acc.email) ? 'approved' : (acc.status || 'pending');
+const statusOf = acc => adminSet().has(acc.email) ? 'approved' : (acc.status || 'pending');
+// Optional phone notification for new sign-ups (SIGNUP_ALERT_URL). No personal details are sent.
+async function signupAlert() {
+  const to = process.env.SIGNUP_ALERT_URL;
+  if (!to || typeof fetch !== 'function') return;
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), 3000);
+  try { await fetch(to, { method: 'POST', body: 'A new BactiFIND account is waiting for your approval. Open the app: Options > Account.', headers: { Title: 'BactiFIND: new account', Tags: 'bust_in_silhouette' }, signal: ctl.signal }); }
+  catch (e) { console.error('Sign-up alert failed:', e.message); } finally { clearTimeout(t); }
+}
 // Details given at sign-up (shown to the admin when approving). Optional for older app versions; when sent, all are required.
 const INFO_FIELDS = { firstName: 60, lastName: 60, designation: 80, institute: 150, phone: 20 };
 function readInfo(x) {
@@ -289,7 +359,9 @@ function cors(req, res) {
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 const send = (res, status, obj) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
-const ipOf = req => String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+// The caller's address: the LAST x-forwarded-for entry is the one added by the host's own proxy (Render, Neon).
+// Earlier entries come from the caller and can be made up, which would get around the attempt limits.
+const ipOf = req => { const xs = String(req.headers['x-forwarded-for'] || '').split(',').map(s => s.trim()).filter(Boolean); return xs.length ? xs[xs.length - 1] : String(req.socket.remoteAddress || ''); };
 const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
 const NUM_FIELDS = ['updatedAt', 'at', 'createdAt'];
 function listQuery(b) {
@@ -323,10 +395,27 @@ async function handle(req, res) {
     if (s !== 'approved') throw new HttpError(403, s === 'rejected' ? 'account-rejected' : 'account-pending', s === 'rejected' ? 'This account was not approved' : 'Waiting for admin approval');
   };
   const pub = acc => ({ uid: acc.uid, email: acc.email, status: statusOf(acc) });
+  // Cloud space: a backup piece counts against its account, a lab record against the member who added it (data.by)
+  const spaceOwner = (s, data) => s[0] === 'users' && s.length === 4 && s[2] === 'backup' ? s[1] : s[0] === 'labs' && s.length === 4 && STREAMS.includes(s[2]) ? String((data && data.by) || '') : null;
+  const storageOf = async (db, acc) => { const u = await db.usage(acc.uid); return { used: u.backup + u.lab, backup: u.backup, lab: u.lab, limit: adminSet().has(acc.email) ? null : STORAGE_LIMIT }; };
+  const withStorage = async acc => Object.assign(pub(acc), { storage: await storageOf(store, acc) });
+  // writes = [{ s, data, old }] about to be stored (checked before anything is written). Only a net growth is
+  // checked, so making data smaller or deleting it always works, even when an account is over the limit.
+  async function checkSpace(db, writes) {
+    const grow = new Map();
+    writes.forEach(w => { const o = spaceOwner(w.s, w.data); if (o) grow.set(o, (grow.get(o) || 0) + docSize(w.data) - docSize(w.old)); });
+    for (const [uid, add] of grow) {
+      if (add <= 0 || (uid === user.uid && isAdmin(user))) continue; // admins have no limit
+      const acc = await db.accountById(uid); if (!acc || adminSet().has(acc.email)) continue;
+      const u = await db.usage(uid), after = u.backup + u.lab + add;
+      if (after > STORAGE_LIMIT) throw new HttpError(413, 'storage-full', `Cloud space is full: ${(after / 1048576).toFixed(2)} MB of ${(STORAGE_LIMIT / 1048576).toFixed(2)} MB would be used`);
+    }
+  }
   // Premium changes are recorded in the admin activity log
   const logPremium = (s, data) => s[0] === 'entitlements' && s.length === 2 && store.audit({ at: Date.now(), by: user.email, action: data.premium ? 'premium-given' : 'premium-removed', uid: s[1], email: data.email || '', until: data.until || null });
 
   if (route === 'GET /' || route === 'GET /api/health') return send(res, 200, { ok: true, service: 'bactifind-api', store: store.kind, dbHost: DB_HOST });
+  await refreshAdmins();
 
   if (route === 'POST /api/auth/signup' || route === 'POST /api/auth/signin') {
     const b = await readBody(req);
@@ -336,14 +425,15 @@ async function handle(req, res) {
     if (route.endsWith('signup')) {
       if (pw.length < 8 || pw.length > 200) throw new HttpError(400, 'auth/weak-password', 'Use a password of at least 8 characters');
       const info = readInfo(b.info);
-      const acc = { uid: newId(20), email, pass: await hashPassword(pw), created_at: Date.now(), status: ADMINS.has(email) ? 'approved' : 'pending', info };
+      const acc = { uid: newId(20), email, pass: await hashPassword(pw), created_at: Date.now(), status: adminSet().has(email) ? 'approved' : 'pending', info };
       if (!(await store.createAccount(acc))) throw new HttpError(409, 'auth/email-already-in-use', 'An account with this email already exists');
-      return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: pub(acc) });
+      if (acc.status === 'pending') await signupAlert();
+      return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: await withStorage(acc) });
     }
     await limit(`signin:${email}`, 10, 15 * 60e3);
     const acc = await store.accountByEmail(email);
     if (!acc || !(await checkPassword(pw, acc.pass))) throw new HttpError(401, 'auth/invalid-credential', 'Wrong email or password');
-    return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: pub(acc) });
+    return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: await withStorage(acc) });
   }
   // Signed-in devices: list, sign out this one, sign out all others
   if (route === 'GET /api/auth/sessions') {
@@ -357,7 +447,7 @@ async function handle(req, res) {
     need();
     const acc = await store.accountById(user.uid);
     if (!acc) throw new HttpError(401, 'unauthenticated', 'Account not found');
-    return send(res, 200, { user: pub(acc), admin: isAdmin(user) });
+    return send(res, 200, { user: await withStorage(acc), admin: isAdmin(user), mainAdmin: isMainAdmin(user) });
   }
   if (route === 'POST /api/auth/password') {
     need();
@@ -374,7 +464,7 @@ async function handle(req, res) {
   // Documents
   if (route === 'POST /api/doc/get') {
     await needApproved(); const b = await readBody(req), s = parsePath(b.path, true); if (!s) throw new HttpError(400, 'bad-path', 'Bad path');
-    if (s[0] === 'admins') return send(res, 200, { data: s[1] === user.uid && isAdmin(user) ? { role: 'admin' } : null }); // admins come from ADMIN_EMAILS
+    if (s[0] === 'admins') return send(res, 200, { data: s[1] === user.uid && isAdmin(user) ? { role: 'admin', main: isMainAdmin(user) } : null }); // admins come from ADMIN_EMAILS and config/admins
     if (!(await canRead(store, s, user))) throw deny();
     return send(res, 200, { data: await store.get(b.path) });
   }
@@ -383,6 +473,7 @@ async function handle(req, res) {
     await store.tx(async db => {
       const old = await db.get(b.path), data = b.merge && old ? Object.assign({}, old, b.data) : b.data;
       if (!(await canWrite(db, s, user, data, old))) throw deny();
+      await checkSpace(db, [{ s, data, old }]);
       await db.put(b.path, data);
       await logPremium(s, data);
     });
@@ -408,31 +499,21 @@ async function handle(req, res) {
     await needApproved(); const b = await readBody(req);
     if (!Array.isArray(b.items) || b.items.length > 500) throw new HttpError(400, 'bad-request', 'Up to 500 items');
     await store.tx(async db => {
+      // Check every item (access, then cloud space) before writing any of them
+      const writes = [];
       for (const it of b.items) {
         const [path, data] = Array.isArray(it) ? it : [];
         const s = parsePath(path, true); if (!s || !isObj(data)) throw new HttpError(400, 'bad-request', 'Bad item');
-        if (!(await canWrite(db, s, user, data, await db.get(path)))) throw deny();
-        await db.put(path, data);
-        await logPremium(s, data);
+        const old = await db.get(path);
+        if (!(await canWrite(db, s, user, data, old))) throw deny();
+        writes.push({ path, s, data, old });
       }
+      await checkSpace(db, writes);
+      for (const w of writes) { await db.put(w.path, w.data); await logPremium(w.s, w.data); }
     });
     return send(res, 200, { ok: true });
   }
 
-  // Usage statistics: anonymous counts of opened modules
-  if (route === 'POST /api/track') {
-    const b = await readBody(req);
-    await limit(`track:${ipOf(req)}`, 600, 3600e3);
-    const name = String(b.name || ''), mod = String((b.params && b.params.module) || '');
-    if (!/^[a-z_]{1,40}$/.test(name) || !/^[A-Za-z0-9_-]{0,40}$/.test(mod)) throw new HttpError(400, 'bad-request', 'Bad event');
-    await store.count(new Date().toISOString().slice(0, 10), name, mod);
-    return send(res, 200, { ok: true });
-  }
-  if (route === 'GET /api/admin/stats') {
-    need(); if (!isAdmin(user)) throw deny();
-    const days = Math.min(Math.max(+url.searchParams.get('days') || 30, 1), 365);
-    return send(res, 200, { days, rows: await store.stats(new Date(Date.now() - days * 864e5).toISOString().slice(0, 10)) });
-  }
   if (route === 'POST /api/admin/temp-password') {
     need(); if (!isAdmin(user)) throw deny();
     const b = await readBody(req), acc = await store.accountById(String(b.uid || ''));
@@ -446,7 +527,7 @@ async function handle(req, res) {
   // Accounts waiting for approval (and rejected ones, which can still be approved later)
   if (route === 'GET /api/admin/pending') {
     need(); if (!isAdmin(user)) throw deny();
-    const rows = (await store.accountsWithStatus(['pending', 'rejected'])).filter(a => !ADMINS.has(a.email));
+    const rows = (await store.accountsWithStatus(['pending', 'rejected'])).filter(a => !adminSet().has(a.email));
     return send(res, 200, { rows });
   }
   // Approve (with Premium for `months`, or no expiry when months is null) or reject a new account
@@ -467,6 +548,135 @@ async function handle(req, res) {
   if (route === 'GET /api/admin/audit') {
     need(); if (!isAdmin(user)) throw deny();
     return send(res, 200, { rows: await store.auditList(Math.min(Math.max(+url.searchParams.get('limit') || 100, 1), 500)) });
+  }
+
+  // Every account, newest first, with sign-up details, Premium and the last sign-in
+  if (route === 'GET /api/admin/accounts') {
+    need(); if (!isAdmin(user)) throw deny();
+    const admins = adminSet();
+    const rows = (await store.allAccounts(2000)).map(a => ({
+      uid: a.uid, email: a.email, created_at: a.created_at, status: statusOf(a), info: a.info || null, last_seen: a.last_seen || null,
+      premium: a.ent ? { premium: !!a.ent.premium, until: a.ent.until || null } : null,
+      admin: admins.has(a.email) ? (ADMINS.has(a.email) ? 'main' : 'added') : null }));
+    return send(res, 200, { rows });
+  }
+  // Change an account's email and/or sign-up details. A new email signs the account out everywhere.
+  if (route === 'POST /api/admin/account/update') {
+    need(); if (!isAdmin(user)) throw deny();
+    const b = await readBody(req), acc = await store.accountById(String(b.uid || ''));
+    if (!acc) throw new HttpError(404, 'not-found', 'No such account');
+    if (ADMINS.has(acc.email) && acc.uid !== user.uid) throw new HttpError(403, 'permission-denied', 'A main admin account can only be changed by its owner');
+    const ch = {};
+    if (b.info != null) ch.info = readInfo(b.info);
+    if (b.email != null) {
+      const email = String(b.email).trim().toLowerCase();
+      if (!EMAIL.test(email)) throw new HttpError(400, 'auth/invalid-email', 'Enter a valid email address');
+      if (email !== acc.email) {
+        if (ADMINS.has(acc.email)) throw new HttpError(400, 'bad-request', 'Change a main admin email in the server settings (ADMIN_EMAILS)');
+        ch.email = email;
+      }
+    }
+    if (!ch.info && !ch.email) return send(res, 200, { ok: true });
+    if (!(await store.updateAccount(acc.uid, ch))) throw new HttpError(409, 'auth/email-already-in-use', 'Another account already uses this email');
+    if (ch.email) {
+      await store.deleteSessionsOf(acc.uid, null); // tokens carry the email, so the user signs in again with the new one
+      const ent = await store.get(`entitlements/${acc.uid}`); if (ent) await store.put(`entitlements/${acc.uid}`, Object.assign(ent, { email: ch.email }));
+      for (const m of await store.memberDocs(acc.uid)) await store.put(m.path, Object.assign(m.data, { email: ch.email }));
+      if (addedAdmins.has(acc.email)) await saveAdded([...addedAdmins].map(e => e === acc.email ? ch.email : e));
+    }
+    await store.audit({ at: Date.now(), by: user.email, action: 'account-edited', uid: acc.uid, email: ch.email || acc.email, from: ch.email ? acc.email : undefined });
+    return send(res, 200, { ok: true });
+  }
+  // Delete an account with its backup, Premium and lab memberships. Its records in shared labs stay with the lab.
+  // A lab it owned passes to another member, or is deleted when it has no other members.
+  if (route === 'POST /api/admin/account/delete') {
+    need(); if (!isAdmin(user)) throw deny();
+    const b = await readBody(req), acc = await store.accountById(String(b.uid || ''));
+    if (!acc) throw new HttpError(404, 'not-found', 'No such account');
+    if (acc.uid === user.uid) throw new HttpError(400, 'bad-request', 'You cannot delete your own account here');
+    if (ADMINS.has(acc.email)) throw new HttpError(403, 'permission-denied', 'Main admin accounts cannot be deleted');
+    if (addedAdmins.has(acc.email) && !isMainAdmin(user)) throw new HttpError(403, 'permission-denied', 'Only a main admin can delete an admin account');
+    await store.tx(async db => {
+      for (const m of await db.memberDocs(acc.uid)) {
+        const labId = m.path.split('/')[1], lab = await db.get(`labs/${labId}`);
+        await db.del(m.path);
+        if (!lab || lab.owner !== acc.uid) continue;
+        const others = await db.docsUnder(`labs/${labId}/members/`);
+        if (others.length) { // oldest remaining member becomes the owner
+          const heir = others.sort((x, y) => (+x.data.at || 0) - (+y.data.at || 0))[0];
+          await db.put(`labs/${labId}`, Object.assign(lab, { owner: heir.path.split('/')[3] }));
+          await db.put(heir.path, Object.assign(heir.data, { role: 'owner' }));
+        } else { // nobody left: remove the lab, its data and its join code
+          for (const d of await db.docsUnder(`labs/${labId}/`)) await db.del(d.path);
+          await db.del(`labs/${labId}`);
+          if (lab.code) await db.del(`joinCodes/${lab.code}`);
+        }
+      }
+      for (const d of await db.docsUnder(`users/${acc.uid}/`)) await db.del(d.path);
+      await db.del(`users/${acc.uid}`);
+      await db.del(`entitlements/${acc.uid}`);
+      await db.deleteAccount(acc.uid);
+      await db.audit({ at: Date.now(), by: user.email, action: 'account-deleted', uid: acc.uid, email: acc.email });
+    });
+    if (addedAdmins.has(acc.email)) await saveAdded([...addedAdmins].filter(e => e !== acc.email));
+    return send(res, 200, { ok: true });
+  }
+  // What is stored for an account: backup items (with counts), devices and labs. ?export=1 also returns the
+  // full backup and the data of its labs, for download; exports are recorded in the activity log.
+  if (route === 'GET /api/admin/user-data') {
+    need(); if (!isAdmin(user)) throw deny();
+    const acc = await store.accountById(String(url.searchParams.get('uid') || ''));
+    if (!acc) throw new HttpError(404, 'not-found', 'No such account');
+    const full = url.searchParams.get('export') === '1';
+    const meta = await store.get(`users/${acc.uid}/meta/backup`), parts = await store.docsUnder(`users/${acc.uid}/backup/`);
+    const byPath = new Map(parts.map(p => [p.path, p.data])), backup = {}, items = [];
+    Object.entries((meta && meta.keys) || {}).forEach(([k, info]) => {
+      let v = '';
+      for (let i = 0; i < (info.parts || 1); i++) { const d = byPath.get(`users/${acc.uid}/backup/${encodeURIComponent(k)}~${i}`); v += (d && d.v) || ''; }
+      let count = null; try { const j = JSON.parse(v); if (Array.isArray(j)) count = j.length; else if (j && typeof j === 'object') count = Object.keys(j).length; } catch (_) {}
+      items.push({ key: k, size: v.length, count });
+      if (full) backup[k] = v;
+    });
+    const labs = [];
+    for (const m of await store.memberDocs(acc.uid)) {
+      const id = m.path.split('/')[1], lab = await store.get(`labs/${id}`);
+      if (!lab) continue;
+      const row = { id, name: lab.name, role: lab.owner === acc.uid ? 'owner' : 'member', code: lab.code || null,
+        members: await store.countChildren(`labs/${id}/members`), isolates: await store.countChildren(`labs/${id}/isolates`), qclog: await store.countChildren(`labs/${id}/qclog`) };
+      if (full) {
+        const all = await store.docsUnder(`labs/${id}/`), pick = sub => all.filter(d => d.path.split('/')[2] === sub).map(d => Object.assign({ id: d.path.split('/')[3] }, d.data));
+        Object.assign(row, { memberList: pick('members'), isolateList: pick('isolates'), qclogList: pick('qclog') });
+      }
+      labs.push(row);
+    }
+    const out = {
+      account: { uid: acc.uid, email: acc.email, status: statusOf(acc), created_at: +acc.created_at, info: acc.info || null },
+      premium: await store.get(`entitlements/${acc.uid}`),
+      devices: (await store.sessionsOf(acc.uid)).map(s => ({ label: s.label, created_at: s.created_at })),
+      backup: { at: (meta && meta.at) || null, items }, labs, storage: await storageOf(store, acc) };
+    if (full) { out.backupData = backup; await store.audit({ at: Date.now(), by: user.email, action: 'data-exported', uid: acc.uid, email: acc.email }); }
+    return send(res, 200, out);
+  }
+  // Admins: list (any admin); add or remove (main admins only). Main admins are set in ADMIN_EMAILS.
+  if (route === 'GET /api/admin/admins') {
+    need(); if (!isAdmin(user)) throw deny();
+    await refreshAdmins(true);
+    return send(res, 200, { main: [...ADMINS], added: [...addedAdmins].filter(e => !ADMINS.has(e)), canManage: isMainAdmin(user) });
+  }
+  if (route === 'POST /api/admin/admins') {
+    need(); if (!isMainAdmin(user)) throw new HttpError(403, 'permission-denied', 'Only a main admin can add or remove admins');
+    const b = await readBody(req), email = String(b.email || '').trim().toLowerCase(), add = b.add !== false;
+    if (!EMAIL.test(email)) throw new HttpError(400, 'auth/invalid-email', 'Enter a valid email address');
+    if (ADMINS.has(email)) throw new HttpError(400, 'bad-request', 'This is a main admin (set in the server settings)');
+    await refreshAdmins(true);
+    const list = new Set(addedAdmins);
+    if (add) list.add(email); else list.delete(email);
+    await saveAdded([...list]);
+    const acc = await store.accountByEmail(email);
+    if (acc && add) await store.setStatus(acc.uid, 'approved');
+    if (acc && !add) await store.deleteSessionsOf(acc.uid, null); // the admin screens close on their devices at once
+    await store.audit({ at: Date.now(), by: user.email, action: add ? 'admin-added' : 'admin-removed', uid: acc ? acc.uid : null, email });
+    return send(res, 200, { ok: true, added: [...addedAdmins] });
   }
 
   throw new HttpError(404, 'not-found', 'Not found');
