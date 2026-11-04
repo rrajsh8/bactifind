@@ -7,6 +7,7 @@
 //   ADMIN_EMAILS     comma-separated admin account emails (they can give Premium and see usage statistics)
 //   ALLOWED_ORIGINS  optional comma-separated list of web origins allowed to call the API (default: any)
 //   PGSSL            optional: require | disable (default: SSL only for external *.render.com database URLs)
+//   MAX_DEVICES      optional: signed-in devices per account (default 2; the oldest is signed out; admins unlimited)
 //   PORT             set by Render
 
 const http = require('http');
@@ -16,6 +17,9 @@ const PORT = +process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const ADMINS = new Set((process.env.ADMIN_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean); // browsers send origins without a trailing slash
+// "*" in an origin matches one name part, e.g. https://*--bactifindpremium.netlify.app for Netlify preview deploys
+const ORIGIN_RES = ORIGINS.map(o => new RegExp('^' + o.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[a-z0-9-]+') + '$', 'i'));
+const MAX_DEVICES = Math.max(1, +process.env.MAX_DEVICES || 2); // signed-in devices per account
 const TOKEN_DAYS = 60;
 const MAX_BODY = 8 * 1024 * 1024;
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
@@ -25,11 +29,18 @@ const SECRET = JWT_SECRET || crypto.randomBytes(32).toString('hex'); // memory m
 
 // ---------------- Storage ----------------
 function memoryStore() {
-  const docs = new Map(), accounts = new Map(), usage = new Map();
+  const docs = new Map(), accounts = new Map(), usage = new Map(), sessions = new Map(), auditLog = [];
   const copy = v => v == null ? null : JSON.parse(JSON.stringify(v));
   return {
     kind: 'memory',
     async init() {},
+    async createSession(s) { sessions.set(s.sid, copy(s)); },
+    async sessionValid(sid, uid) { const s = sessions.get(sid); return !!(s && s.uid === uid); },
+    async sessionsOf(uid) { return [...sessions.values()].filter(s => s.uid === uid).sort((a, b) => b.created_at - a.created_at).map(copy); },
+    async deleteSession(sid) { sessions.delete(sid); },
+    async deleteSessionsOf(uid, keepSid) { [...sessions.values()].forEach(s => { if (s.uid === uid && s.sid !== keepSid) sessions.delete(s.sid); }); },
+    async audit(entry) { auditLog.push(copy(entry)); },
+    async auditList(limit) { return auditLog.slice().sort((a, b) => b.at - a.at).slice(0, limit).map(copy); },
     async get(path) { return copy(docs.get(path)); },
     async put(path, data) { docs.set(path, copy(data)); },
     async del(path) { docs.delete(path); },
@@ -78,14 +89,24 @@ function pgStore(url) {
     async createAccount(a) { const r = await q('INSERT INTO accounts (uid, email, pass, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING', [a.uid, a.email, a.pass, a.created_at]); return r.rowCount === 1; },
     async setPassword(uid, pass) { await q('UPDATE accounts SET pass = $2 WHERE uid = $1', [uid, pass]); },
     async count(day, name, module) { await q('INSERT INTO usage (day, name, module, n) VALUES ($1, $2, $3, 1) ON CONFLICT (day, name, module) DO UPDATE SET n = usage.n + 1', [day, name, module]); },
-    async stats(sinceDay) { const r = await q('SELECT name, module, SUM(n)::int AS n FROM usage WHERE day >= $1 GROUP BY name, module ORDER BY n DESC LIMIT 200', [sinceDay]); return r.rows; }
+    async stats(sinceDay) { const r = await q('SELECT name, module, SUM(n)::int AS n FROM usage WHERE day >= $1 GROUP BY name, module ORDER BY n DESC LIMIT 200', [sinceDay]); return r.rows; },
+    async createSession(s) { await q('INSERT INTO sessions (sid, uid, created_at, label) VALUES ($1, $2, $3, $4)', [s.sid, s.uid, s.created_at, s.label]); },
+    async sessionValid(sid, uid) { const r = await q('SELECT 1 FROM sessions WHERE sid = $1 AND uid = $2', [sid, uid]); return r.rowCount === 1; },
+    async sessionsOf(uid) { const r = await q('SELECT sid, uid, created_at, label FROM sessions WHERE uid = $1 ORDER BY created_at DESC', [uid]); return r.rows.map(x => Object.assign(x, { created_at: +x.created_at })); },
+    async deleteSession(sid) { await q('DELETE FROM sessions WHERE sid = $1', [sid]); },
+    async deleteSessionsOf(uid, keepSid) { await q('DELETE FROM sessions WHERE uid = $1 AND sid <> $2', [uid, keepSid || '']); },
+    async audit(entry) { await q('INSERT INTO audit (at, data) VALUES ($1, $2)', [entry.at, JSON.stringify(entry)]); },
+    async auditList(limit) { const r = await q('SELECT data FROM audit ORDER BY at DESC LIMIT $1', [limit]); return r.rows.map(x => x.data); }
   });
   const base = make((sql, args) => pool.query(sql, args));
   base.init = async () => {
     await pool.query(`CREATE TABLE IF NOT EXISTS accounts (uid text PRIMARY KEY, email text UNIQUE NOT NULL, pass text NOT NULL, created_at bigint NOT NULL);
       CREATE TABLE IF NOT EXISTS docs (path text PRIMARY KEY, parent text NOT NULL, data jsonb NOT NULL, updated_at bigint NOT NULL);
       CREATE INDEX IF NOT EXISTS docs_parent ON docs (parent);
-      CREATE TABLE IF NOT EXISTS usage (day date NOT NULL, name text NOT NULL, module text NOT NULL, n integer NOT NULL DEFAULT 0, PRIMARY KEY (day, name, module));`);
+      CREATE TABLE IF NOT EXISTS usage (day date NOT NULL, name text NOT NULL, module text NOT NULL, n integer NOT NULL DEFAULT 0, PRIMARY KEY (day, name, module));
+      CREATE TABLE IF NOT EXISTS sessions (sid text PRIMARY KEY, uid text NOT NULL, created_at bigint NOT NULL, label text);
+      CREATE INDEX IF NOT EXISTS sessions_uid ON sessions (uid);
+      CREATE TABLE IF NOT EXISTS audit (id bigserial PRIMARY KEY, at bigint NOT NULL, data jsonb NOT NULL);`);
   };
   base.tx = async fn => {
     const c = await pool.connect();
@@ -111,9 +132,10 @@ function checkPassword(pw, stored) {
   if (alg !== 'scrypt' || !salt || !hash) return Promise.resolve(false);
   return new Promise(ok => crypto.scrypt(pw, Buffer.from(salt, 'hex'), 64, { N: 16384, r: 8, p: 1 }, (e, k) => ok(!e && crypto.timingSafeEqual(k, Buffer.from(hash, 'hex')))));
 }
-function signToken(acc) {
+// Each sign-in is a session (one device); the token carries its id (sid) so ending the session ends the token
+function signToken(acc, sid) {
   const head = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const body = b64u(JSON.stringify({ sub: acc.uid, email: acc.email, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + TOKEN_DAYS * 86400 }));
+  const body = b64u(JSON.stringify({ sub: acc.uid, email: acc.email, sid, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + TOKEN_DAYS * 86400 }));
   return `${head}.${body}.${b64u(crypto.createHmac('sha256', SECRET).update(`${head}.${body}`).digest())}`;
 }
 function readToken(tok) {
@@ -122,7 +144,18 @@ function readToken(tok) {
   const want = Buffer.from(b64u(crypto.createHmac('sha256', SECRET).update(`${p[0]}.${p[1]}`).digest()));
   const got = Buffer.from(p[2]);
   if (want.length !== got.length || !crypto.timingSafeEqual(want, got)) return null;
-  try { const c = JSON.parse(Buffer.from(p[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString()); return c.exp > Date.now() / 1000 ? { uid: c.sub, email: c.email } : null; } catch (_) { return null; }
+  try { const c = JSON.parse(Buffer.from(p[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString()); return c.exp > Date.now() / 1000 && c.sid ? { uid: c.sub, email: c.email, sid: c.sid } : null; } catch (_) { return null; }
+}
+// New session for a sign-in; beyond MAX_DEVICES the oldest sessions end (admins are not limited)
+async function startSession(acc, req) {
+  const sid = newId(24), ua = String(req.headers['user-agent'] || '');
+  const label = /Android/i.test(ua) ? (/; wv\)/.test(ua) ? 'Android app' : 'Android browser') : /iPhone|iPad/i.test(ua) ? 'iPhone / iPad' : /Windows/i.test(ua) ? 'Windows browser' : /Mac OS/i.test(ua) ? 'Mac browser' : 'Browser';
+  await store.createSession({ sid, uid: acc.uid, created_at: Date.now(), label });
+  if (!ADMINS.has(acc.email)) {
+    const all = await store.sessionsOf(acc.uid);
+    for (const s of all.slice(MAX_DEVICES)) await store.deleteSession(s.sid);
+  }
+  return sid;
 }
 const newId = n => { const a = 'abcdefghjkmnpqrstuvwxyz23456789'; let s = ''; crypto.randomBytes(n).forEach(b => { s += a[b % a.length]; }); return s; };
 
@@ -216,7 +249,7 @@ function readBody(req) {
 }
 function cors(req, res) {
   const o = req.headers.origin;
-  res.setHeader('Access-Control-Allow-Origin', !ORIGINS.length ? '*' : (o && ORIGINS.includes(o) ? o : ORIGINS[0]));
+  res.setHeader('Access-Control-Allow-Origin', !ORIGINS.length ? '*' : (o && ORIGIN_RES.some(re => re.test(o)) ? o : ORIGINS.find(x => !x.includes('*')) || 'null'));
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -246,8 +279,12 @@ async function handle(req, res) {
   const url = new URL(req.url, 'http://x');
   const route = `${req.method} ${url.pathname}`;
   const auth = String(req.headers.authorization || '');
-  const user = auth.startsWith('Bearer ') ? readToken(auth.slice(7)) : null;
-  const need = () => { if (!user) throw new HttpError(401, 'unauthenticated', 'Sign in again'); };
+  let user = auth.startsWith('Bearer ') ? readToken(auth.slice(7)) : null;
+  let ended = false; // the token is valid but its session was ended (signed in on too many devices, signed out elsewhere, password reset)
+  if (user && !(await store.sessionValid(user.sid, user.uid))) { user = null; ended = true; }
+  const need = () => { if (!user) throw ended ? new HttpError(401, 'session-ended', 'Signed out on this device') : new HttpError(401, 'unauthenticated', 'Sign in again'); };
+  // Premium changes are recorded in the admin activity log
+  const logPremium = (s, data) => s[0] === 'entitlements' && s.length === 2 && store.audit({ at: Date.now(), by: user.email, action: data.premium ? 'premium-given' : 'premium-removed', uid: s[1], email: data.email || '', until: data.until || null });
 
   if (route === 'GET /' || route === 'GET /api/health') return send(res, 200, { ok: true, service: 'bactifind-api', store: store.kind, dbHost: DB_HOST });
 
@@ -260,13 +297,21 @@ async function handle(req, res) {
       if (pw.length < 8 || pw.length > 200) throw new HttpError(400, 'auth/weak-password', 'Use a password of at least 8 characters');
       const acc = { uid: newId(20), email, pass: await hashPassword(pw), created_at: Date.now() };
       if (!(await store.createAccount(acc))) throw new HttpError(409, 'auth/email-already-in-use', 'An account with this email already exists');
-      return send(res, 200, { token: signToken(acc), user: { uid: acc.uid, email } });
+      return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: { uid: acc.uid, email } });
     }
     limit(`signin:${email}`, 10, 15 * 60e3);
     const acc = await store.accountByEmail(email);
     if (!acc || !(await checkPassword(pw, acc.pass))) throw new HttpError(401, 'auth/invalid-credential', 'Wrong email or password');
-    return send(res, 200, { token: signToken(acc), user: { uid: acc.uid, email } });
+    return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: { uid: acc.uid, email } });
   }
+  // Signed-in devices: list, sign out this one, sign out all others
+  if (route === 'GET /api/auth/sessions') {
+    need();
+    const all = await store.sessionsOf(user.uid);
+    return send(res, 200, { max: isAdmin(user) ? null : MAX_DEVICES, sessions: all.map(s => ({ label: s.label, created_at: s.created_at, current: s.sid === user.sid })) });
+  }
+  if (route === 'POST /api/auth/signout') { if (user) await store.deleteSession(user.sid); return send(res, 200, { ok: true }); }
+  if (route === 'POST /api/auth/signout-others') { need(); await store.deleteSessionsOf(user.uid, user.sid); return send(res, 200, { ok: true }); }
   if (route === 'GET /api/auth/me') {
     need();
     const acc = await store.accountById(user.uid);
@@ -281,6 +326,7 @@ async function handle(req, res) {
     if (!acc || !(await checkPassword(String(b.old || ''), acc.pass))) throw new HttpError(401, 'auth/invalid-credential', 'Current password is wrong');
     if (String(b.password || '').length < 8) throw new HttpError(400, 'auth/weak-password', 'Use a password of at least 8 characters');
     await store.setPassword(user.uid, await hashPassword(String(b.password)));
+    await store.deleteSessionsOf(user.uid, user.sid); // a new password signs out every other device
     return send(res, 200, { ok: true });
   }
 
@@ -297,6 +343,7 @@ async function handle(req, res) {
       const old = await db.get(b.path), data = b.merge && old ? Object.assign({}, old, b.data) : b.data;
       if (!(await canWrite(db, s, user, data, old))) throw deny();
       await db.put(b.path, data);
+      await logPremium(s, data);
     });
     return send(res, 200, { ok: true });
   }
@@ -325,6 +372,7 @@ async function handle(req, res) {
         const s = parsePath(path, true); if (!s || !isObj(data)) throw new HttpError(400, 'bad-request', 'Bad item');
         if (!(await canWrite(db, s, user, data, await db.get(path)))) throw deny();
         await db.put(path, data);
+        await logPremium(s, data);
       }
     });
     return send(res, 200, { ok: true });
@@ -350,7 +398,13 @@ async function handle(req, res) {
     if (!acc) throw new HttpError(404, 'not-found', 'No such account');
     const pw = newId(10);
     await store.setPassword(acc.uid, await hashPassword(pw));
+    await store.deleteSessionsOf(acc.uid, null); // the old password's devices are signed out
+    await store.audit({ at: Date.now(), by: user.email, action: 'temp-password', uid: acc.uid, email: acc.email });
     return send(res, 200, { password: pw });
+  }
+  if (route === 'GET /api/admin/audit') {
+    need(); if (!isAdmin(user)) throw deny();
+    return send(res, 200, { rows: await store.auditList(Math.min(Math.max(+url.searchParams.get('limit') || 100, 1), 500)) });
   }
 
   throw new HttpError(404, 'not-found', 'Not found');
