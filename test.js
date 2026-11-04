@@ -44,6 +44,38 @@ const test = async (name, fn) => { await fn(); passed++; console.log('✔', name
     await no('/api/doc/get', { path: 'users/x' }, null, 401);
   });
 
+  await test('new accounts wait for admin approval', async () => {
+    assert.strictEqual(alice.user.status, 'pending');
+    assert.strictEqual(admin.user.status, 'approved'); // admins never wait
+    const blocked = await no('/api/doc/get', { path: `users/${alice.user.uid}` }, alice.token);
+    assert.strictEqual(blocked.error, 'account-pending');
+    await no('/api/doc/set', { path: `users/${alice.user.uid}`, data: { email: 'alice@lab.test' } }, alice.token);
+    await no('/api/doc/batch', { items: [] }, alice.token);
+    assert.strictEqual((await ok('/api/auth/me', null, alice.token)).user.status, 'pending');
+    // only admins see and decide
+    await no('/api/admin/pending', null, alice.token);
+    await no('/api/admin/approve', { uid: alice.user.uid }, alice.token);
+    const list = await ok('/api/admin/pending', null, admin.token);
+    const mine = rows => rows.filter(r => r.email.endsWith('@lab.test')); // a test database copy may hold other accounts
+    assert.deepStrictEqual(mine(list.rows).map(r => r.email).sort(), ['alice@lab.test', 'bob@lab.test', 'eve@lab.test']);
+    await no('/api/admin/approve', { uid: alice.user.uid, months: -1 }, admin.token, 400);
+    await ok('/api/admin/approve', { uid: alice.user.uid, months: 12 }, admin.token);
+    await ok('/api/admin/approve', { uid: bob.user.uid, months: null }, admin.token);
+    await ok('/api/admin/approve', { uid: eve.user.uid, approve: false }, admin.token);
+    assert.strictEqual((await ok('/api/auth/me', null, alice.token)).user.status, 'approved');
+    const ent = await get(`entitlements/${alice.user.uid}`, alice.token);
+    assert.ok(ent.premium && ent.until > Date.now() + 300 * 864e5);
+    assert.strictEqual((await get(`entitlements/${bob.user.uid}`, bob.token)).until, null);
+    assert.strictEqual((await no('/api/doc/get', { path: `users/${eve.user.uid}` }, eve.token)).error, 'account-rejected');
+    assert.deepStrictEqual(mine((await ok('/api/admin/pending', null, admin.token)).rows).map(r => [r.email, r.status]), [['eve@lab.test', 'rejected']]);
+    const log = await ok('/api/admin/audit', null, admin.token);
+    assert.ok(log.rows.some(r => r.action === 'account-approved' && r.email === 'alice@lab.test'));
+    assert.ok(log.rows.some(r => r.action === 'account-rejected' && r.email === 'eve@lab.test'));
+    // a rejected account can still be approved later
+    await ok('/api/admin/approve', { uid: eve.user.uid, months: 1 }, admin.token);
+    await ok('/api/doc/get', { path: `users/${eve.user.uid}` }, eve.token);
+  });
+
   await test('profiles: own only; email must match the account', async () => {
     await set(`users/${alice.user.uid}`, { email: 'alice@lab.test', createdAt: 1 }, alice.token);
     await no('/api/doc/set', { path: `users/${alice.user.uid}`, data: { email: 'other@lab.test' } }, alice.token);
