@@ -1,0 +1,16 @@
+# Keeps the free Render web service awake by opening its health page every 10 minutes.
+# GitHub may delay scheduled runs by a few minutes when busy; Render sleeps after ~15 idle minutes.
+name: Keep server awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Open /api/health
+        run: curl -fsS --max-time 90 https://bactifind-api.onrender.com/api/health
