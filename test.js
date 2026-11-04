@@ -1,9 +1,13 @@
 'use strict';
 // Server tests in memory mode (no database needed): npm test
 process.env.ADMIN_EMAILS = 'admin@lab.test';
-delete process.env.DATABASE_URL;
+process.env.ALLOWED_ORIGINS = 'https://site.test,https://*--site.test';
+process.env.MAX_DEVICES = '2';
+// TEST_DATABASE_URL = run against a throwaway PostgreSQL database (e.g. a Neon branch); otherwise in memory. Never use the live database.
+if (process.env.TEST_DATABASE_URL) process.env.DATABASE_URL = process.env.TEST_DATABASE_URL; else delete process.env.DATABASE_URL;
+if (process.env.DATABASE_URL && !process.env.JWT_SECRET) process.env.JWT_SECRET = require('crypto').randomBytes(32).toString('hex');
 const assert = require('assert');
-const { server } = require('./server');
+const { server, store } = require('./server');
 
 let base, passed = 0;
 const call = async (path, body, token, method) => {
@@ -15,6 +19,8 @@ const no = async (p, b, t, status) => { const r = await call(p, b, t); assert.st
 const test = async (name, fn) => { await fn(); passed++; console.log('✔', name); };
 
 (async () => {
+  await store.init();
+  console.log(`store: ${store.kind}`);
   await new Promise(r => server.listen(0, r));
   base = `http://127.0.0.1:${server.address().port}`;
   const get = (p, t) => ok('/api/doc/get', { path: p }, t).then(b => b.data);
@@ -131,6 +137,54 @@ const test = async (name, fn) => { await fn(); passed++; console.log('✔', name
     assert.deepStrictEqual(s.body.rows.find(r => r.module === 'qc-modal').n, 2);
   });
 
+  await test('device limit: a third sign-in ends the oldest session', async () => {
+    const c1 = await ok('/api/auth/signup', { email: 'carol@lab.test', password: 'carolpass1' });
+    const c2 = await ok('/api/auth/signin', { email: 'carol@lab.test', password: 'carolpass1' });
+    await ok('/api/auth/me', null, c1.token);
+    const c3 = await ok('/api/auth/signin', { email: 'carol@lab.test', password: 'carolpass1' });
+    const gone = await no('/api/auth/me', null, c1.token, 401);
+    assert.strictEqual(gone.error, 'session-ended');
+    await ok('/api/auth/me', null, c2.token); await ok('/api/auth/me', null, c3.token);
+    const list = await ok('/api/auth/sessions', null, c3.token);
+    assert.strictEqual(list.sessions.length, 2); assert.strictEqual(list.max, 2);
+    assert.strictEqual(list.sessions.filter(s => s.current).length, 1);
+    // sign out others, then sign out this device
+    await ok('/api/auth/signout-others', {}, c3.token);
+    await no('/api/auth/me', null, c2.token, 401);
+    await ok('/api/auth/signout', {}, c3.token);
+    await no('/api/auth/me', null, c3.token, 401);
+    // admins are not limited
+    const a2 = await ok('/api/auth/signin', { email: 'admin@lab.test', password: 'adminpass1' });
+    await ok('/api/auth/signin', { email: 'admin@lab.test', password: 'adminpass1' });
+    await ok('/api/auth/signin', { email: 'admin@lab.test', password: 'adminpass1' });
+    await ok('/api/auth/me', null, admin.token); await ok('/api/auth/me', null, a2.token);
+  });
+
+  await test('password change signs out other devices', async () => {
+    const d1 = await ok('/api/auth/signup', { email: 'dan@lab.test', password: 'danpass123' });
+    const d2 = await ok('/api/auth/signin', { email: 'dan@lab.test', password: 'danpass123' });
+    await ok('/api/auth/password', { old: 'danpass123', password: 'dannewpass1' }, d2.token);
+    await no('/api/auth/me', null, d1.token, 401);
+    await ok('/api/auth/me', null, d2.token);
+  });
+
+  await test('admin activity log records Premium changes', async () => {
+    const log = await ok('/api/admin/audit', null, admin.token);
+    const given = log.rows.find(r => r.action === 'premium-given' && r.uid === alice.user.uid);
+    assert.ok(given, 'premium-given entry for alice');
+    assert.strictEqual(given.by, 'admin@lab.test');
+    assert.ok(log.rows.some(r => r.action === 'temp-password'));
+    await no('/api/admin/audit', null, eve.token);
+  });
+
+  await test('allowed origins, including Netlify preview wildcards', async () => {
+    const cors = async o => (await fetch(base + '/api/health', { headers: { Origin: o } })).headers.get('access-control-allow-origin');
+    assert.strictEqual(await cors('https://site.test'), 'https://site.test');
+    assert.strictEqual(await cors('https://6aea8d0a--site.test'), 'https://6aea8d0a--site.test');
+    assert.notStrictEqual(await cors('https://evil.test'), 'https://evil.test');
+    assert.notStrictEqual(await cors('https://x.evil--site.test.evil'), 'https://x.evil--site.test.evil');
+  });
+
   await test('bad paths are rejected', async () => {
     await no('/api/doc/get', { path: '../etc/passwd' }, alice.token, 400);
     await no('/api/doc/get', { path: 'users' }, alice.token, 400);
@@ -139,4 +193,5 @@ const test = async (name, fn) => { await fn(); passed++; console.log('✔', name
 
   console.log(`\nAll ${passed} test groups passed.`);
   server.close();
+  process.exit(0); // the database pool would otherwise keep the process open
 })().catch(e => { console.error('✖', e.message); process.exit(1); });
