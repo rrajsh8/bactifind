@@ -29,11 +29,13 @@ const SECRET = JWT_SECRET || crypto.randomBytes(32).toString('hex'); // memory m
 
 // ---------------- Storage ----------------
 function memoryStore() {
-  const docs = new Map(), accounts = new Map(), usage = new Map(), sessions = new Map(), auditLog = [];
+  const docs = new Map(), accounts = new Map(), usage = new Map(), sessions = new Map(), auditLog = [], hits = new Map();
   const copy = v => v == null ? null : JSON.parse(JSON.stringify(v));
+  setInterval(() => { const now = Date.now(); hits.forEach((h, k) => { if (now - h.t > 3600e3) hits.delete(k); }); }, 600e3).unref();
   return {
     kind: 'memory',
     async init() {},
+    async hit(key, windowMs) { const now = Date.now(), h = hits.get(key); if (!h || now - h.t > windowMs) { hits.set(key, { t: now, n: 1 }); return 1; } return ++h.n; },
     async createSession(s) { sessions.set(s.sid, copy(s)); },
     async sessionValid(sid, uid) { const s = sessions.get(sid); return !!(s && s.uid === uid); },
     async sessionsOf(uid) { return [...sessions.values()].filter(s => s.uid === uid).sort((a, b) => b.created_at - a.created_at).map(copy); },
@@ -57,7 +59,7 @@ function memoryStore() {
     async createAccount(a) { if ([...accounts.values()].some(x => x.email === a.email)) return false; accounts.set(a.uid, copy(a)); return true; },
     async setPassword(uid, pass) { const a = accounts.get(uid); if (a) a.pass = pass; },
     async setStatus(uid, status) { const a = accounts.get(uid); if (a) a.status = status; },
-    async accountsWithStatus(list) { return [...accounts.values()].filter(a => list.includes(a.status)).sort((a, b) => b.created_at - a.created_at).slice(0, 200).map(a => ({ uid: a.uid, email: a.email, created_at: a.created_at, status: a.status })); },
+    async accountsWithStatus(list) { return [...accounts.values()].filter(a => list.includes(a.status)).sort((a, b) => b.created_at - a.created_at).slice(0, 200).map(a => ({ uid: a.uid, email: a.email, created_at: a.created_at, status: a.status, info: copy(a.info || null) })); },
     async count(day, name, module) { const k = `${day}|${name}|${module}`; usage.set(k, (usage.get(k) || 0) + 1); },
     async stats(sinceDay) { const out = {}; usage.forEach((n, k) => { const [d, name, m] = k.split('|'); if (d >= sinceDay) { const key = `${name}|${m}`; out[key] = (out[key] || 0) + n; } }); return Object.entries(out).map(([k, n]) => { const [name, module] = k.split('|'); return { name, module, n }; }).sort((a, b) => b.n - a.n); }
   };
@@ -68,6 +70,7 @@ function pgStore(url) {
   // Render's internal URL (host "dpg-…-a") needs no SSL; external Render, Neon and Supabase URLs do. PGSSL=require|disable overrides.
   const useSsl = process.env.PGSSL ? process.env.PGSSL === 'require' : /\.render\.com|neon\.tech|supabase\.co|sslmode=require/.test(url);
   const pool = new Pool({ connectionString: url, ssl: useSsl ? { rejectUnauthorized: false } : false, max: 5 });
+  pool.on('error', e => console.error('Idle database connection dropped:', e.message)); // the pool reconnects on the next query
   const make = q => ({
     kind: 'postgres',
     async get(path) { const r = await q('SELECT data FROM docs WHERE path = $1', [path]); return r.rows[0] ? r.rows[0].data : null; },
@@ -88,10 +91,10 @@ function pgStore(url) {
     },
     async accountByEmail(email) { const r = await q('SELECT * FROM accounts WHERE email = $1', [email]); return r.rows[0] || null; },
     async accountById(uid) { const r = await q('SELECT * FROM accounts WHERE uid = $1', [uid]); return r.rows[0] || null; },
-    async createAccount(a) { const r = await q('INSERT INTO accounts (uid, email, pass, created_at, status) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (email) DO NOTHING', [a.uid, a.email, a.pass, a.created_at, a.status]); return r.rowCount === 1; },
+    async createAccount(a) { const r = await q('INSERT INTO accounts (uid, email, pass, created_at, status, info) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (email) DO NOTHING', [a.uid, a.email, a.pass, a.created_at, a.status, a.info ? JSON.stringify(a.info) : null]); return r.rowCount === 1; },
     async setPassword(uid, pass) { await q('UPDATE accounts SET pass = $2 WHERE uid = $1', [uid, pass]); },
     async setStatus(uid, status) { await q('UPDATE accounts SET status = $2 WHERE uid = $1', [uid, status]); },
-    async accountsWithStatus(list) { const r = await q('SELECT uid, email, created_at, status FROM accounts WHERE status = ANY($1) ORDER BY created_at DESC LIMIT 200', [list]); return r.rows.map(x => Object.assign(x, { created_at: +x.created_at })); },
+    async accountsWithStatus(list) { const r = await q('SELECT uid, email, created_at, status, info FROM accounts WHERE status = ANY($1) ORDER BY created_at DESC LIMIT 200', [list]); return r.rows.map(x => Object.assign(x, { created_at: +x.created_at })); },
     async count(day, name, module) { await q('INSERT INTO usage (day, name, module, n) VALUES ($1, $2, $3, 1) ON CONFLICT (day, name, module) DO UPDATE SET n = usage.n + 1', [day, name, module]); },
     async stats(sinceDay) { const r = await q('SELECT name, module, SUM(n)::int AS n FROM usage WHERE day >= $1 GROUP BY name, module ORDER BY n DESC LIMIT 200', [sinceDay]); return r.rows; },
     async createSession(s) { await q('INSERT INTO sessions (sid, uid, created_at, label) VALUES ($1, $2, $3, $4)', [s.sid, s.uid, s.created_at, s.label]); },
@@ -100,6 +103,13 @@ function pgStore(url) {
     async deleteSession(sid) { await q('DELETE FROM sessions WHERE sid = $1', [sid]); },
     async deleteSessionsOf(uid, keepSid) { await q('DELETE FROM sessions WHERE uid = $1 AND sid <> $2', [uid, keepSid || '']); },
     async audit(entry) { await q('INSERT INTO audit (at, data) VALUES ($1, $2)', [entry.at, JSON.stringify(entry)]); },
+    async hit(key, windowMs) {
+      const now = Date.now();
+      if (Math.random() < 0.02) await q('DELETE FROM ratelimit WHERE t < $1', [now - 3600e3]); // tidy old counters now and then
+      const r = await q(`INSERT INTO ratelimit (k, t, n) VALUES ($1, $2, 1) ON CONFLICT (k) DO UPDATE SET
+          n = CASE WHEN ratelimit.t < $3 THEN 1 ELSE ratelimit.n + 1 END, t = CASE WHEN ratelimit.t < $3 THEN $2 ELSE ratelimit.t END RETURNING n`, [key, now, now - windowMs]);
+      return r.rows[0].n;
+    },
     async auditList(limit) { const r = await q('SELECT data FROM audit ORDER BY at DESC LIMIT $1', [limit]); return r.rows.map(x => x.data); }
   });
   const base = make((sql, args) => pool.query(sql, args));
@@ -112,6 +122,8 @@ function pgStore(url) {
       CREATE INDEX IF NOT EXISTS sessions_uid ON sessions (uid);
       CREATE TABLE IF NOT EXISTS audit (id bigserial PRIMARY KEY, at bigint NOT NULL, data jsonb NOT NULL);
       ALTER TABLE accounts ADD COLUMN IF NOT EXISTS status text;
+      ALTER TABLE accounts ADD COLUMN IF NOT EXISTS info jsonb;
+      CREATE TABLE IF NOT EXISTS ratelimit (k text PRIMARY KEY, t bigint NOT NULL, n integer NOT NULL);
       UPDATE accounts a SET status = CASE WHEN EXISTS (SELECT 1 FROM docs d WHERE d.path = 'entitlements/' || a.uid AND d.data ->> 'premium' = 'true') THEN 'approved' ELSE 'pending' END WHERE a.status IS NULL;`);
     // Accounts made before admin approval existed: approved if they already had Premium, otherwise waiting for approval (query above)
   };
@@ -170,6 +182,20 @@ const newId = n => { const a = 'abcdefghjkmnpqrstuvwxyz23456789'; let s = ''; cr
 const isAdmin = u => !!(u && ADMINS.has(u.email));
 // New accounts wait for an admin: 'pending' until approved, or 'rejected'. Admin accounts are always approved.
 const statusOf = acc => ADMINS.has(acc.email) ? 'approved' : (acc.status || 'pending');
+// Details given at sign-up (shown to the admin when approving). Optional for older app versions; when sent, all are required.
+const INFO_FIELDS = { firstName: 60, lastName: 60, designation: 80, institute: 150, phone: 20 };
+function readInfo(x) {
+  if (x == null) return null;
+  if (!isObj(x) || !keysOnly(x, Object.keys(INFO_FIELDS))) throw new HttpError(400, 'auth/bad-details', 'Fill in your details');
+  const out = {};
+  for (const [k, max] of Object.entries(INFO_FIELDS)) {
+    const v = String(x[k] == null ? '' : x[k]).replace(/\s+/g, ' ').trim();
+    if (!v || v.length > max) throw new HttpError(400, 'auth/bad-details', 'Fill in your details');
+    out[k] = v;
+  }
+  if (!/^\+?[0-9][0-9 -]{6,18}$/.test(out.phone)) throw new HttpError(400, 'auth/bad-phone', 'Enter a valid phone number');
+  return out;
+}
 const SEG = /^[A-Za-z0-9_.~%-]{1,150}$/;
 function parsePath(p, docPath) {
   if (typeof p !== 'string' || p.length > 400) return null;
@@ -241,13 +267,11 @@ async function canList(db, s, u, q) {
 // ---------------- HTTP helpers ----------------
 class HttpError extends Error { constructor(status, code, message) { super(message || code); this.status = status; this.code = code; } }
 const deny = () => new HttpError(403, 'permission-denied', 'Not allowed');
-const hits = new Map(); // simple in-memory rate limiter
-function limit(key, max, windowMs) {
-  const now = Date.now(), h = hits.get(key);
-  if (!h || now - h.t > windowMs) { hits.set(key, { t: now, n: 1 }); return; }
-  if (++h.n > max) throw new HttpError(429, 'too-many-requests', 'Too many attempts — try again later');
+// Attempt limits (sign-in, sign-up, password, statistics) are counted in the store, so they also hold
+// when several copies of the server run at once (Neon Functions)
+async function limit(key, max, windowMs) {
+  if ((await store.hit(key, windowMs)) > max) throw new HttpError(429, 'too-many-requests', 'Too many attempts — try again later');
 }
-setInterval(() => { const now = Date.now(); hits.forEach((h, k) => { if (now - h.t > 3600e3) hits.delete(k); }); }, 600e3).unref();
 function readBody(req) {
   return new Promise((ok, bad) => {
     let size = 0; const chunks = [];
@@ -307,15 +331,16 @@ async function handle(req, res) {
   if (route === 'POST /api/auth/signup' || route === 'POST /api/auth/signin') {
     const b = await readBody(req);
     const email = String(b.email || '').trim().toLowerCase(), pw = String(b.password || '');
-    limit(`auth:${ipOf(req)}`, 30, 15 * 60e3);
+    await limit(`auth:${ipOf(req)}`, 30, 15 * 60e3);
     if (!EMAIL.test(email)) throw new HttpError(400, 'auth/invalid-email', 'Enter a valid email address');
     if (route.endsWith('signup')) {
       if (pw.length < 8 || pw.length > 200) throw new HttpError(400, 'auth/weak-password', 'Use a password of at least 8 characters');
-      const acc = { uid: newId(20), email, pass: await hashPassword(pw), created_at: Date.now(), status: ADMINS.has(email) ? 'approved' : 'pending' };
+      const info = readInfo(b.info);
+      const acc = { uid: newId(20), email, pass: await hashPassword(pw), created_at: Date.now(), status: ADMINS.has(email) ? 'approved' : 'pending', info };
       if (!(await store.createAccount(acc))) throw new HttpError(409, 'auth/email-already-in-use', 'An account with this email already exists');
       return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: pub(acc) });
     }
-    limit(`signin:${email}`, 10, 15 * 60e3);
+    await limit(`signin:${email}`, 10, 15 * 60e3);
     const acc = await store.accountByEmail(email);
     if (!acc || !(await checkPassword(pw, acc.pass))) throw new HttpError(401, 'auth/invalid-credential', 'Wrong email or password');
     return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: pub(acc) });
@@ -337,7 +362,7 @@ async function handle(req, res) {
   if (route === 'POST /api/auth/password') {
     need();
     const b = await readBody(req);
-    limit(`pw:${user.uid}`, 10, 15 * 60e3);
+    await limit(`pw:${user.uid}`, 10, 15 * 60e3);
     const acc = await store.accountById(user.uid);
     if (!acc || !(await checkPassword(String(b.old || ''), acc.pass))) throw new HttpError(401, 'auth/invalid-credential', 'Current password is wrong');
     if (String(b.password || '').length < 8) throw new HttpError(400, 'auth/weak-password', 'Use a password of at least 8 characters');
@@ -397,7 +422,7 @@ async function handle(req, res) {
   // Usage statistics: anonymous counts of opened modules
   if (route === 'POST /api/track') {
     const b = await readBody(req);
-    limit(`track:${ipOf(req)}`, 600, 3600e3);
+    await limit(`track:${ipOf(req)}`, 600, 3600e3);
     const name = String(b.name || ''), mod = String((b.params && b.params.module) || '');
     if (!/^[a-z_]{1,40}$/.test(name) || !/^[A-Za-z0-9_-]{0,40}$/.test(mod)) throw new HttpError(400, 'bad-request', 'Bad event');
     await store.count(new Date().toISOString().slice(0, 10), name, mod);
@@ -447,16 +472,16 @@ async function handle(req, res) {
   throw new HttpError(404, 'not-found', 'Not found');
 }
 
-const server = http.createServer((req, res) => {
-  handle(req, res).catch(e => {
-    const status = e instanceof HttpError ? e.status : 500;
-    if (status === 500) console.error(e);
-    if (!res.headersSent) send(res, status, { error: e.code || 'internal', message: status === 500 ? 'Server error' : e.message });
-  });
+// One request: Node's own server (Render, tests) and the Neon Functions adapter (neon/index.mjs) both call this
+const dispatch = (req, res) => handle(req, res).catch(e => {
+  const status = e instanceof HttpError ? e.status : 500;
+  if (status === 500) console.error(e);
+  if (!res.headersSent) send(res, status, { error: e.code || 'internal', message: status === 500 ? 'Server error' : e.message });
 });
+const server = http.createServer(dispatch);
 
 if (require.main === module) {
   store.init().then(() => server.listen(PORT, () => console.log(`BactiFIND API on :${PORT} (${store.kind} store)`)))
     .catch(e => { console.error('Database setup failed:', e); process.exit(1); });
 }
-module.exports = { server, store, readToken, signToken };
+module.exports = { server, store, dispatch, readToken, signToken };
