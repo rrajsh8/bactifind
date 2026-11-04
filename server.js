@@ -15,7 +15,7 @@ const crypto = require('crypto');
 const PORT = +process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || '';
 const ADMINS = new Set((process.env.ADMIN_EMAILS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean));
-const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean); // browsers send origins without a trailing slash
 const TOKEN_DAYS = 60;
 const MAX_BODY = 8 * 1024 * 1024;
 if (!JWT_SECRET || JWT_SECRET.length < 32) {
@@ -52,8 +52,8 @@ function memoryStore() {
 
 function pgStore(url) {
   const { Pool } = require('pg');
-  // Render's internal URL (host "dpg-…-a") needs no SSL; its external URL (…render.com) does. PGSSL=require|disable overrides.
-  const useSsl = process.env.PGSSL ? process.env.PGSSL === 'require' : /\.render\.com/.test(url);
+  // Render's internal URL (host "dpg-…-a") needs no SSL; external Render, Neon and Supabase URLs do. PGSSL=require|disable overrides.
+  const useSsl = process.env.PGSSL ? process.env.PGSSL === 'require' : /\.render\.com|neon\.tech|supabase\.co|sslmode=require/.test(url);
   const pool = new Pool({ connectionString: url, ssl: useSsl ? { rejectUnauthorized: false } : false, max: 5 });
   const make = q => ({
     kind: 'postgres',
@@ -97,6 +97,8 @@ function pgStore(url) {
 }
 
 const store = process.env.DATABASE_URL ? pgStore(process.env.DATABASE_URL) : memoryStore();
+// Database host only (no user or password), shown by /api/health so you can see which database is in use
+const DB_HOST = (() => { try { return process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).hostname : null; } catch (_) { return 'unparsable DATABASE_URL'; } })();
 
 // ---------------- Passwords and tokens ----------------
 const b64u = b => Buffer.from(b).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
@@ -247,7 +249,7 @@ async function handle(req, res) {
   const user = auth.startsWith('Bearer ') ? readToken(auth.slice(7)) : null;
   const need = () => { if (!user) throw new HttpError(401, 'unauthenticated', 'Sign in again'); };
 
-  if (route === 'GET /' || route === 'GET /api/health') return send(res, 200, { ok: true, service: 'bactifind-api', store: store.kind });
+  if (route === 'GET /' || route === 'GET /api/health') return send(res, 200, { ok: true, service: 'bactifind-api', store: store.kind, dbHost: DB_HOST });
 
   if (route === 'POST /api/auth/signup' || route === 'POST /api/auth/signin') {
     const b = await readBody(req);
