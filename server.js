@@ -56,6 +56,8 @@ function memoryStore() {
     async accountById(uid) { return copy(accounts.get(uid) || null); },
     async createAccount(a) { if ([...accounts.values()].some(x => x.email === a.email)) return false; accounts.set(a.uid, copy(a)); return true; },
     async setPassword(uid, pass) { const a = accounts.get(uid); if (a) a.pass = pass; },
+    async setStatus(uid, status) { const a = accounts.get(uid); if (a) a.status = status; },
+    async accountsWithStatus(list) { return [...accounts.values()].filter(a => list.includes(a.status)).sort((a, b) => b.created_at - a.created_at).slice(0, 200).map(a => ({ uid: a.uid, email: a.email, created_at: a.created_at, status: a.status })); },
     async count(day, name, module) { const k = `${day}|${name}|${module}`; usage.set(k, (usage.get(k) || 0) + 1); },
     async stats(sinceDay) { const out = {}; usage.forEach((n, k) => { const [d, name, m] = k.split('|'); if (d >= sinceDay) { const key = `${name}|${m}`; out[key] = (out[key] || 0) + n; } }); return Object.entries(out).map(([k, n]) => { const [name, module] = k.split('|'); return { name, module, n }; }).sort((a, b) => b.n - a.n); }
   };
@@ -86,8 +88,10 @@ function pgStore(url) {
     },
     async accountByEmail(email) { const r = await q('SELECT * FROM accounts WHERE email = $1', [email]); return r.rows[0] || null; },
     async accountById(uid) { const r = await q('SELECT * FROM accounts WHERE uid = $1', [uid]); return r.rows[0] || null; },
-    async createAccount(a) { const r = await q('INSERT INTO accounts (uid, email, pass, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING', [a.uid, a.email, a.pass, a.created_at]); return r.rowCount === 1; },
+    async createAccount(a) { const r = await q('INSERT INTO accounts (uid, email, pass, created_at, status) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (email) DO NOTHING', [a.uid, a.email, a.pass, a.created_at, a.status]); return r.rowCount === 1; },
     async setPassword(uid, pass) { await q('UPDATE accounts SET pass = $2 WHERE uid = $1', [uid, pass]); },
+    async setStatus(uid, status) { await q('UPDATE accounts SET status = $2 WHERE uid = $1', [uid, status]); },
+    async accountsWithStatus(list) { const r = await q('SELECT uid, email, created_at, status FROM accounts WHERE status = ANY($1) ORDER BY created_at DESC LIMIT 200', [list]); return r.rows.map(x => Object.assign(x, { created_at: +x.created_at })); },
     async count(day, name, module) { await q('INSERT INTO usage (day, name, module, n) VALUES ($1, $2, $3, 1) ON CONFLICT (day, name, module) DO UPDATE SET n = usage.n + 1', [day, name, module]); },
     async stats(sinceDay) { const r = await q('SELECT name, module, SUM(n)::int AS n FROM usage WHERE day >= $1 GROUP BY name, module ORDER BY n DESC LIMIT 200', [sinceDay]); return r.rows; },
     async createSession(s) { await q('INSERT INTO sessions (sid, uid, created_at, label) VALUES ($1, $2, $3, $4)', [s.sid, s.uid, s.created_at, s.label]); },
@@ -106,7 +110,10 @@ function pgStore(url) {
       CREATE TABLE IF NOT EXISTS usage (day date NOT NULL, name text NOT NULL, module text NOT NULL, n integer NOT NULL DEFAULT 0, PRIMARY KEY (day, name, module));
       CREATE TABLE IF NOT EXISTS sessions (sid text PRIMARY KEY, uid text NOT NULL, created_at bigint NOT NULL, label text);
       CREATE INDEX IF NOT EXISTS sessions_uid ON sessions (uid);
-      CREATE TABLE IF NOT EXISTS audit (id bigserial PRIMARY KEY, at bigint NOT NULL, data jsonb NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS audit (id bigserial PRIMARY KEY, at bigint NOT NULL, data jsonb NOT NULL);
+      ALTER TABLE accounts ADD COLUMN IF NOT EXISTS status text;
+      UPDATE accounts a SET status = CASE WHEN EXISTS (SELECT 1 FROM docs d WHERE d.path = 'entitlements/' || a.uid AND d.data ->> 'premium' = 'true') THEN 'approved' ELSE 'pending' END WHERE a.status IS NULL;`);
+    // Accounts made before admin approval existed: approved if they already had Premium, otherwise waiting for approval (query above)
   };
   base.tx = async fn => {
     const c = await pool.connect();
@@ -161,6 +168,8 @@ const newId = n => { const a = 'abcdefghjkmnpqrstuvwxyz23456789'; let s = ''; cr
 
 // ---------------- Access rules (mirror the app's expectations) ----------------
 const isAdmin = u => !!(u && ADMINS.has(u.email));
+// New accounts wait for an admin: 'pending' until approved, or 'rejected'. Admin accounts are always approved.
+const statusOf = acc => ADMINS.has(acc.email) ? 'approved' : (acc.status || 'pending');
 const SEG = /^[A-Za-z0-9_.~%-]{1,150}$/;
 function parsePath(p, docPath) {
   if (typeof p !== 'string' || p.length > 400) return null;
@@ -283,6 +292,13 @@ async function handle(req, res) {
   let ended = false; // the token is valid but its session was ended (signed in on too many devices, signed out elsewhere, password reset)
   if (user && !(await store.sessionValid(user.sid, user.uid))) { user = null; ended = true; }
   const need = () => { if (!user) throw ended ? new HttpError(401, 'session-ended', 'Signed out on this device') : new HttpError(401, 'unauthenticated', 'Sign in again'); };
+  // Data routes: the account must be approved by an admin
+  const needApproved = async () => {
+    need(); if (isAdmin(user)) return;
+    const acc = await store.accountById(user.uid), s = acc ? statusOf(acc) : 'pending';
+    if (s !== 'approved') throw new HttpError(403, s === 'rejected' ? 'account-rejected' : 'account-pending', s === 'rejected' ? 'This account was not approved' : 'Waiting for admin approval');
+  };
+  const pub = acc => ({ uid: acc.uid, email: acc.email, status: statusOf(acc) });
   // Premium changes are recorded in the admin activity log
   const logPremium = (s, data) => s[0] === 'entitlements' && s.length === 2 && store.audit({ at: Date.now(), by: user.email, action: data.premium ? 'premium-given' : 'premium-removed', uid: s[1], email: data.email || '', until: data.until || null });
 
@@ -295,14 +311,14 @@ async function handle(req, res) {
     if (!EMAIL.test(email)) throw new HttpError(400, 'auth/invalid-email', 'Enter a valid email address');
     if (route.endsWith('signup')) {
       if (pw.length < 8 || pw.length > 200) throw new HttpError(400, 'auth/weak-password', 'Use a password of at least 8 characters');
-      const acc = { uid: newId(20), email, pass: await hashPassword(pw), created_at: Date.now() };
+      const acc = { uid: newId(20), email, pass: await hashPassword(pw), created_at: Date.now(), status: ADMINS.has(email) ? 'approved' : 'pending' };
       if (!(await store.createAccount(acc))) throw new HttpError(409, 'auth/email-already-in-use', 'An account with this email already exists');
-      return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: { uid: acc.uid, email } });
+      return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: pub(acc) });
     }
     limit(`signin:${email}`, 10, 15 * 60e3);
     const acc = await store.accountByEmail(email);
     if (!acc || !(await checkPassword(pw, acc.pass))) throw new HttpError(401, 'auth/invalid-credential', 'Wrong email or password');
-    return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: { uid: acc.uid, email } });
+    return send(res, 200, { token: signToken(acc, await startSession(acc, req)), user: pub(acc) });
   }
   // Signed-in devices: list, sign out this one, sign out all others
   if (route === 'GET /api/auth/sessions') {
@@ -316,7 +332,7 @@ async function handle(req, res) {
     need();
     const acc = await store.accountById(user.uid);
     if (!acc) throw new HttpError(401, 'unauthenticated', 'Account not found');
-    return send(res, 200, { user: { uid: acc.uid, email: acc.email }, admin: isAdmin(user) });
+    return send(res, 200, { user: pub(acc), admin: isAdmin(user) });
   }
   if (route === 'POST /api/auth/password') {
     need();
@@ -332,13 +348,13 @@ async function handle(req, res) {
 
   // Documents
   if (route === 'POST /api/doc/get') {
-    need(); const b = await readBody(req), s = parsePath(b.path, true); if (!s) throw new HttpError(400, 'bad-path', 'Bad path');
+    await needApproved(); const b = await readBody(req), s = parsePath(b.path, true); if (!s) throw new HttpError(400, 'bad-path', 'Bad path');
     if (s[0] === 'admins') return send(res, 200, { data: s[1] === user.uid && isAdmin(user) ? { role: 'admin' } : null }); // admins come from ADMIN_EMAILS
     if (!(await canRead(store, s, user))) throw deny();
     return send(res, 200, { data: await store.get(b.path) });
   }
   if (route === 'POST /api/doc/set') {
-    need(); const b = await readBody(req), s = parsePath(b.path, true); if (!s || !isObj(b.data)) throw new HttpError(400, 'bad-request', 'Bad path or data');
+    await needApproved(); const b = await readBody(req), s = parsePath(b.path, true); if (!s || !isObj(b.data)) throw new HttpError(400, 'bad-request', 'Bad path or data');
     await store.tx(async db => {
       const old = await db.get(b.path), data = b.merge && old ? Object.assign({}, old, b.data) : b.data;
       if (!(await canWrite(db, s, user, data, old))) throw deny();
@@ -348,7 +364,7 @@ async function handle(req, res) {
     return send(res, 200, { ok: true });
   }
   if (route === 'POST /api/doc/delete') {
-    need(); const b = await readBody(req), s = parsePath(b.path, true); if (!s) throw new HttpError(400, 'bad-path', 'Bad path');
+    await needApproved(); const b = await readBody(req), s = parsePath(b.path, true); if (!s) throw new HttpError(400, 'bad-path', 'Bad path');
     await store.tx(async db => {
       const old = await db.get(b.path);
       if (!old) return;
@@ -358,13 +374,13 @@ async function handle(req, res) {
     return send(res, 200, { ok: true });
   }
   if (route === 'POST /api/doc/list') {
-    need(); const b = await readBody(req), s = parsePath(b.coll, false); if (!s) throw new HttpError(400, 'bad-path', 'Bad collection');
+    await needApproved(); const b = await readBody(req), s = parsePath(b.coll, false); if (!s) throw new HttpError(400, 'bad-path', 'Bad collection');
     const q = listQuery(b);
     if (!(await canList(store, s, user, q))) throw deny();
     return send(res, 200, { rows: await store.children(b.coll, q) });
   }
   if (route === 'POST /api/doc/batch') {
-    need(); const b = await readBody(req);
+    await needApproved(); const b = await readBody(req);
     if (!Array.isArray(b.items) || b.items.length > 500) throw new HttpError(400, 'bad-request', 'Up to 500 items');
     await store.tx(async db => {
       for (const it of b.items) {
@@ -401,6 +417,27 @@ async function handle(req, res) {
     await store.deleteSessionsOf(acc.uid, null); // the old password's devices are signed out
     await store.audit({ at: Date.now(), by: user.email, action: 'temp-password', uid: acc.uid, email: acc.email });
     return send(res, 200, { password: pw });
+  }
+  // Accounts waiting for approval (and rejected ones, which can still be approved later)
+  if (route === 'GET /api/admin/pending') {
+    need(); if (!isAdmin(user)) throw deny();
+    const rows = (await store.accountsWithStatus(['pending', 'rejected'])).filter(a => !ADMINS.has(a.email));
+    return send(res, 200, { rows });
+  }
+  // Approve (with Premium for `months`, or no expiry when months is null) or reject a new account
+  if (route === 'POST /api/admin/approve') {
+    need(); if (!isAdmin(user)) throw deny();
+    const b = await readBody(req), acc = await store.accountById(String(b.uid || ''));
+    if (!acc) throw new HttpError(404, 'not-found', 'No such account');
+    const approve = b.approve !== false, months = b.months == null ? null : +b.months;
+    if (approve && months != null && !(months > 0 && months <= 120)) throw new HttpError(400, 'bad-request', 'Bad months');
+    const until = approve && months ? Date.now() + months * 30.44 * 864e5 : null;
+    await store.tx(async db => {
+      await db.setStatus(acc.uid, approve ? 'approved' : 'rejected');
+      await db.put(`entitlements/${acc.uid}`, approve ? { premium: true, until, email: acc.email, by: user.uid, at: Date.now() } : { premium: false, email: acc.email, by: user.uid, at: Date.now() });
+      await db.audit({ at: Date.now(), by: user.email, action: approve ? 'account-approved' : 'account-rejected', uid: acc.uid, email: acc.email, until });
+    });
+    return send(res, 200, { ok: true, status: approve ? 'approved' : 'rejected' });
   }
   if (route === 'GET /api/admin/audit') {
     need(); if (!isAdmin(user)) throw deny();
